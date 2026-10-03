@@ -249,6 +249,19 @@ impl WebdavCore {
             req = req.header(header::CONTENT_DISPOSITION, v)
         }
 
+        // RFC 7232 preconditions evaluated by the server
+        if args.if_not_exists() {
+            req = req.header(header::IF_NONE_MATCH, "*");
+        }
+
+        if let Some(v) = args.if_none_match() {
+            req = req.header(header::IF_NONE_MATCH, v)
+        }
+
+        if let Some(v) = args.if_match() {
+            req = req.header(header::IF_MATCH, v)
+        }
+
         let req = req
             .extension(Operation::Write)
             .extension(ServiceOperation("Put"))
@@ -1660,6 +1673,22 @@ mod tests {
             ErrorContext::new(ServiceOperation("Get")).with_if_match(true),
             resp,
         );
+        assert_eq!(err.kind(), ErrorKind::ConditionNotMatch);
+    }
+
+    #[test]
+    fn test_parse_error_maps_write_missing_if_match_to_condition_not_match() {
+        // For writes, if_match on a missing file is a false condition and must
+        // surface as ConditionNotMatch, not NotFound. The write path therefore
+        // never enables the read-side `with_if_match` special case.
+        let resp = Response::builder()
+            .status(StatusCode::PRECONDITION_FAILED)
+            .body(Buffer::from(
+                "An If-Match header was specified and the resource did not exist",
+            ))
+            .unwrap();
+
+        let err = parse_error(ErrorContext::new(ServiceOperation("Put")), resp);
         assert_eq!(err.kind(), ErrorKind::ConditionNotMatch);
     }
 }

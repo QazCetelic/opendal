@@ -216,6 +216,9 @@ impl Builder for WebdavBuilder {
 
                 write: true,
                 write_can_empty: true,
+                write_with_if_match: true,
+                write_with_if_none_match: true,
+                write_with_if_not_exists: true,
                 write_with_user_metadata: true,
 
                 create_dir: true,
