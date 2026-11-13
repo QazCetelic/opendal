@@ -1,0 +1,40 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+services:
+  webdav-apache:
+    image: httpd:latest
+    ports:
+      - "8080:80"
+    environment:
+      # Restrict Apache to a single process to test preconditions
+      APACHE_START_SERVERS: "1"
+      APACHE_SERVER_LIMIT: "1"
+      APACHE_THREADS_PER_CHILD: "1"
+      APACHE_MAX_REQUEST_WORKERS: "1"
+      APACHE_MIN_SPARE_THREADS: "1"
+      APACHE_MAX_SPARE_THREADS: "2"
+    volumes:
+      - ./apache/httpd.conf:/usr/local/apache2/conf/httpd.conf:ro
+    tmpfs:
+      - /var/www/webdav:rw,mode=1777,size=256m
+      - /usr/local/apache2/var:rw,mode=1777,size=16m
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/80'"]
+      interval: 1s
+      timeout: 2s
+      retries: 30

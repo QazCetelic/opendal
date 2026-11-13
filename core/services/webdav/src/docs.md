@@ -20,6 +20,13 @@ Inspect the effective capability set with [`opendal_core::Operator::info`] and
 Bazel Remote Caching and Ccache HTTP Storage is also part of this service.
 Users can use `webdav` to connect those services.
 
+Conditional writes send `If-Match` / `If-None-Match` preconditions on `PUT`
+and the server evaluates them atomically with the write. Support depends on
+the backing system: servers that ignore write preconditions cannot honor
+these conditions. Use [`opendal_core::layers::CapabilityOverrideLayer`] to
+disable `write_with_if_match`, `write_with_if_none_match` and
+`write_with_if_not_exists` for such endpoints.
+
 ## Configuration
 
 Use [`crate::WebdavConfig`] for serializable configuration and this builder's

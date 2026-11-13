@@ -81,6 +81,55 @@ static HEADER_DESTINATION: &str = "Destination";
 /// reference: [RFC4918: 10.6.  Overwrite Header](https://datatracker.ietf.org/doc/html/rfc4918#section-10.6)
 static HEADER_OVERWRITE: &str = "Overwrite";
 
+/// The WebDAV `If` header, supports both weak or strong comparison (RFC 4918 Section 10.4.4).
+static HEADER_IF: &str = "If";
+
+/// Returns true if `etag` is a weak entity-tag.
+fn is_weak_etag(etag: &str) -> bool {
+    etag.trim_start().starts_with("W/")
+}
+
+/// Apply RFC 7232 preconditions to a mutation request (`PUT`, `DELETE`).
+///
+/// Some WebDAV implementations only support weak ETags, which require the
+/// WebDAV `If` header, while others only support `If-Match`. This
+/// implementation sends whichever combination the server can honor.
+fn apply_etag_preconditions(
+    mut req: http::request::Builder,
+    if_not_exists: bool,
+    if_match: Option<&str>,
+    if_none_match: Option<&str>,
+) -> http::request::Builder {
+    if if_not_exists {
+        req = req.header(header::IF_NONE_MATCH, "*");
+    }
+
+    let mut dav_if = Vec::new();
+
+    if let Some(v) = if_none_match {
+        req = req.header(header::IF_NONE_MATCH, v);
+        if is_weak_etag(v) {
+            // It's safe to send both headers for compatibility since it's a negative match
+            dav_if.push(format!("Not [{}]", v.trim()));
+        }
+    }
+
+    if let Some(v) = if_match {
+        if is_weak_etag(v) {
+            // Do not also send If-Match: it can never match a weak validator and would make the combined request fail with 412.
+            dav_if.push(format!("[{}]", v.trim()));
+        } else {
+            req = req.header(header::IF_MATCH, v);
+        }
+    }
+
+    if !dav_if.is_empty() {
+        req = req.header(HEADER_IF, format!("({})", dav_if.join(" ")));
+    }
+
+    req
+}
+
 pub struct WebdavCore {
     pub info: ServiceInfo,
     pub capability: Capability,
@@ -139,6 +188,15 @@ impl WebdavCore {
             .map_err(new_request_build_error)?;
 
         let resp = ctx.http_transport().send(req).await?;
+        // A server that rejects the URL shape, such as a file path with a
+        // trailing slash, identifies no resource at this path.
+        if resp.status() == StatusCode::BAD_REQUEST {
+            return Err(Error::new(
+                ErrorKind::NotFound,
+                format!("stat {rooted_abs_path} failed: the server rejected the path"),
+            )
+            .with_operation(Operation::Stat));
+        }
         if !resp.status().is_success() {
             return Err(parse_error(
                 ErrorContext::new(ServiceOperation("Propfind")),
@@ -250,17 +308,12 @@ impl WebdavCore {
         }
 
         // RFC 7232 preconditions evaluated by the server
-        if args.if_not_exists() {
-            req = req.header(header::IF_NONE_MATCH, "*");
-        }
-
-        if let Some(v) = args.if_none_match() {
-            req = req.header(header::IF_NONE_MATCH, v)
-        }
-
-        if let Some(v) = args.if_match() {
-            req = req.header(header::IF_MATCH, v)
-        }
+        req = apply_etag_preconditions(
+            req,
+            args.if_not_exists(),
+            args.if_match(),
+            args.if_none_match(),
+        );
 
         let req = req
             .extension(Operation::Write)
@@ -315,6 +368,7 @@ impl WebdavCore {
         &self,
         ctx: &OperationContext,
         path: &str,
+        args: &OpDelete,
     ) -> Result<Response<Buffer>> {
         let path = build_rooted_abs_path(&self.root, path);
         let url = format!("{}{}", self.endpoint, percent_encode_path(&path));
@@ -324,6 +378,9 @@ impl WebdavCore {
         if let Some(auth) = &self.authorization {
             req = req.header(header::AUTHORIZATION, auth.clone())
         }
+
+        // RFC 7232 preconditions evaluated by the server
+        req = apply_etag_preconditions(req, false, args.if_match(), args.if_none_match());
 
         let req = req
             .extension(Operation::Delete)
@@ -1690,6 +1747,140 @@ mod tests {
 
         let err = parse_error(ErrorContext::new(ServiceOperation("Put")), resp);
         assert_eq!(err.kind(), ErrorKind::ConditionNotMatch);
+    }
+
+    fn write_request(options: opendal_core::options::WriteOptions) -> http::Request<()> {
+        let (args, _) = OpWrite::from_options(&opendal_core::Capability::default(), options)
+            .expect("write options must lower");
+        apply_etag_preconditions(
+            http::Request::put("http://example.com/test"),
+            args.if_not_exists(),
+            args.if_match(),
+            args.if_none_match(),
+        )
+        .body(())
+        .expect("request must build")
+    }
+
+    fn delete_request(options: opendal_core::options::DeleteOptions) -> http::Request<()> {
+        let args = OpDelete::from_options(&opendal_core::Capability::default(), options)
+            .expect("delete options must lower");
+        apply_etag_preconditions(
+            http::Request::delete("http://example.com/test"),
+            false,
+            args.if_match(),
+            args.if_none_match(),
+        )
+        .body(())
+        .expect("request must build")
+    }
+
+    #[test]
+    fn test_write_preconditions_strong_etag_uses_if_match() {
+        let req = write_request(opendal_core::options::WriteOptions {
+            if_match: Some("\"strong\"".to_string()),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            req.headers()
+                .get(header::IF_MATCH)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "\"strong\""
+        );
+        assert!(req.headers().get(HEADER_IF).is_none());
+    }
+
+    #[test]
+    fn test_write_preconditions_weak_etag_uses_dav_if() {
+        let req = write_request(opendal_core::options::WriteOptions {
+            if_match: Some("W/\"weak\"".to_string()),
+            ..Default::default()
+        });
+
+        assert!(req.headers().get(header::IF_MATCH).is_none());
+        assert_eq!(
+            req.headers().get(HEADER_IF).unwrap().to_str().unwrap(),
+            "([W/\"weak\"])"
+        );
+    }
+
+    #[test]
+    fn test_write_preconditions_weak_if_none_match_uses_both() {
+        let req = write_request(opendal_core::options::WriteOptions {
+            if_none_match: Some("W/\"weak\"".to_string()),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            req.headers()
+                .get(header::IF_NONE_MATCH)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "W/\"weak\""
+        );
+        assert_eq!(
+            req.headers().get(HEADER_IF).unwrap().to_str().unwrap(),
+            "(Not [W/\"weak\"])"
+        );
+    }
+
+    #[test]
+    fn test_write_preconditions_strong_if_none_match_has_no_dav_if() {
+        let req = write_request(opendal_core::options::WriteOptions {
+            if_none_match: Some("\"strong\"".to_string()),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            req.headers()
+                .get(header::IF_NONE_MATCH)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "\"strong\""
+        );
+        assert!(req.headers().get(HEADER_IF).is_none());
+    }
+
+    #[test]
+    fn test_write_preconditions_if_not_exists_uses_star() {
+        let req = write_request(opendal_core::options::WriteOptions {
+            if_not_exists: true,
+            ..Default::default()
+        });
+
+        assert_eq!(
+            req.headers()
+                .get(header::IF_NONE_MATCH)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "*"
+        );
+        assert!(req.headers().get(HEADER_IF).is_none());
+    }
+
+    #[test]
+    fn test_delete_preconditions_strong_etag_uses_if_match() {
+        let req = delete_request(opendal_core::options::DeleteOptions {
+            if_match: Some("\"strong\"".to_string()),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            req.headers()
+                .get(header::IF_MATCH)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "\"strong\""
+        );
+        assert!(req.headers().get(header::IF_NONE_MATCH).is_none());
+        assert!(req.headers().get(HEADER_IF).is_none());
     }
 }
 
