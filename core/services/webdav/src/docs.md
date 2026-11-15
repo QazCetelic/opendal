@@ -1,31 +1,47 @@
 ## Capabilities
 
-Depending on its configuration and the backing system, this service can expose:
+There are many WebDAV server implementations, but they are unfortunately not all to standard.
+The table below shows these differences.
+If undefined behavior from deviating implementations is not acceptable, consider disabling capabilities with the `CapabilityOverrideLayer`.
+Also note that some servers derive ETags from the modification time with one-second resolution, this means the preconditions won't work reliably if requests are sent within that window.
 
-- [x] create_dir
-- [x] stat
-- [x] read
-- [x] write
-- [x] delete
-- [x] list
-- [x] copy
-- [x] rename
-- [ ] ~~presign~~
-
-Inspect the effective capability set with [`opendal_core::Operator::info`] and
-[`opendal_core::OperatorInfo::capability`] after building an operator.
+| Capability (mechanism) | Apache httpd | lighttpd | SabreDAV (Nextcloud, ownCloud) | nginx |
+| --- | --- | --- | --- | --- |
+| `stat`, `list` (`PROPFIND`) | Yes | Yes | Yes | Yes |
+| `read` (`GET`) | Yes | Yes | Yes | Yes |
+| `read_with_suffix` (`Range` on `GET`) | Yes | Yes | Yes | Yes |
+| `read_with_if_match` (`If-Match` on `GET`) | No (weak ETag) | No (GET unchecked) | Yes | No (ignored) |
+| `read_with_if_none_match` (`If-None-Match` on `GET`) | Yes | No (GET unchecked) | Yes | No (ignored) |
+| `read_with_if_modified_since` (`If-Modified-Since` on `GET`) | Yes | No (GET unchecked) | Yes | No (ignored) |
+| `read_with_if_unmodified_since` (`If-Unmodified-Since` on `GET`) | Yes | No (GET unchecked) | Yes | No (ignored) |
+| `write`, `write_can_empty` (`PUT`) | Yes | Yes | Yes | Yes |
+| `write_with_if_match` (tagged `If` list on `PUT`) | Yes | Yes | Yes | No (ignored) |
+| `write_with_if_none_match` (`If-None-Match` and tagged `If` list on `PUT`) | Yes | Yes | Yes | No (ignored) |
+| `write_with_if_not_exists` (`If-None-Match: *` on `PUT`) | Yes | Yes | Yes | No (ignored) |
+| `write_with_user_metadata` (`PROPPATCH`) | No (not implemented) | Yes | No (test disabled) | No (not implemented) |
+| `create_dir` (`MKCOL`) | Yes | Yes | Yes | Yes |
+| `delete` (`DELETE`) | Yes | Yes | Yes | Yes |
+| `delete_with_if_match` (tagged `If` list on `DELETE`) | Yes | Yes | Yes | No (ignored) |
+| `delete_with_if_none_match` (`If-None-Match` and tagged `If` list on `DELETE`) | Yes | Yes | Yes | No (ignored) |
+| `copy` (`COPY`) | Yes | Yes | Yes | Yes |
+| `copy_with_if_not_exists` (`Overwrite: F` on `COPY`) | Yes | Yes | Yes | Yes |
+| `copy_with_if_match` (tagged `If` list on the `COPY` destination) | Yes | No (source checked) | Yes | No (ignored) |
+| `rename` (`MOVE`) | Yes | Yes | Yes | Yes |
+| `rename_with_if_not_exists` (`Overwrite: F` on `MOVE`) | Yes | Yes | Yes | Yes |
+| `shared` (server-side state) | Yes | Yes | Yes | Yes |
 
 ## Notes
 
 Bazel Remote Caching and Ccache HTTP Storage is also part of this service.
 Users can use `webdav` to connect those services.
 
-Conditional writes send `If-Match` / `If-None-Match` preconditions on `PUT`
-and the server evaluates them atomically with the write. Support depends on
-the backing system: servers that ignore write preconditions cannot honor
-these conditions. Use [`opendal_core::layers::CapabilityOverrideLayer`] to
-disable `write_with_if_match`, `write_with_if_none_match` and
-`write_with_if_not_exists` for such endpoints.
+ETag conditions travel in a tagged `If` list naming the resource they describe:
+the request URI for `read`, `write` and `delete`, and the destination for
+`copy`. `if_none_match` also sends `If-None-Match`, because implementations
+enforce different one of the two spellings. `if_not_exists` sends
+`If-None-Match: *` on `PUT` and `Overwrite: F` on `COPY` and `MOVE`. A negated
+ETag condition is not available for `copy`, because no tested server enforces
+`Not [...]` on the destination.
 
 ## Configuration
 

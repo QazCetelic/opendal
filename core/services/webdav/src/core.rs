@@ -84,18 +84,18 @@ static HEADER_OVERWRITE: &str = "Overwrite";
 /// The WebDAV `If` header, supports both weak or strong comparison (RFC 4918 Section 10.4.4).
 static HEADER_IF: &str = "If";
 
-/// Returns true if `etag` is a weak entity-tag.
-fn is_weak_etag(etag: &str) -> bool {
-    etag.trim_start().starts_with("W/")
-}
-
 /// Apply RFC 7232 preconditions to a mutation request (`PUT`, `DELETE`).
 ///
-/// Some WebDAV implementations only support weak ETags, which require the
-/// WebDAV `If` header, while others only support `If-Match`. This
-/// implementation sends whichever combination the server can honor.
+/// Every condition is expressed as a tagged WebDAV `If` list naming the request
+/// URI. The untagged form is not portable: `mod_dav` evaluates it against the
+/// parent collection for `DELETE`, and `If-Match` can never match the weak
+/// ETags it returns.
+///
+/// `if_none_match` additionally sends `If-None-Match`, because some servers only
+/// enforce one of the two.
 fn apply_etag_preconditions(
     mut req: http::request::Builder,
+    uri: &str,
     if_not_exists: bool,
     if_match: Option<&str>,
     if_none_match: Option<&str>,
@@ -108,23 +108,15 @@ fn apply_etag_preconditions(
 
     if let Some(v) = if_none_match {
         req = req.header(header::IF_NONE_MATCH, v);
-        if is_weak_etag(v) {
-            // It's safe to send both headers for compatibility since it's a negative match
-            dav_if.push(format!("Not [{}]", v.trim()));
-        }
+        dav_if.push(format!("Not [{}]", v.trim()));
     }
 
     if let Some(v) = if_match {
-        if is_weak_etag(v) {
-            // Do not also send If-Match: it can never match a weak validator and would make the combined request fail with 412.
-            dav_if.push(format!("[{}]", v.trim()));
-        } else {
-            req = req.header(header::IF_MATCH, v);
-        }
+        dav_if.push(format!("[{}]", v.trim()));
     }
 
     if !dav_if.is_empty() {
-        req = req.header(HEADER_IF, format!("({})", dav_if.join(" ")));
+        req = req.header(HEADER_IF, format!("<{uri}> ({})", dav_if.join(" ")));
     }
 
     req
@@ -310,6 +302,7 @@ impl WebdavCore {
         // RFC 7232 preconditions evaluated by the server
         req = apply_etag_preconditions(
             req,
+            &url,
             args.if_not_exists(),
             args.if_match(),
             args.if_none_match(),
@@ -380,8 +373,7 @@ impl WebdavCore {
         }
 
         // RFC 7232 preconditions evaluated by the server
-        req = apply_etag_preconditions(req, false, args.if_match(), args.if_none_match());
-
+        req = apply_etag_preconditions(req, &url, false, args.if_match(), args.if_none_match());
         let req = req
             .extension(Operation::Delete)
             .extension(ServiceOperation("Delete"))
@@ -396,6 +388,7 @@ impl WebdavCore {
         ctx: &OperationContext,
         from: &str,
         to: &str,
+        args: &OpCopy,
     ) -> Result<Response<Buffer>> {
         // Make sure target's dir is exist.
         self.webdav_mkcol(ctx, get_parent(to)).await?;
@@ -412,8 +405,19 @@ impl WebdavCore {
             req = req.header(header::AUTHORIZATION, auth);
         }
 
+        // Copy conditions describe the destination, which RFC 7232 headers cannot
+        // express because they apply to the request URI. `if_not_exists` maps to
+        // the destination policy and `if_match` to a tagged `If` list naming the
+        // destination.
+        req = req.header(
+            HEADER_OVERWRITE,
+            if args.if_not_exists() { "F" } else { "T" },
+        );
+        if let Some(v) = args.if_match() {
+            req = req.header(HEADER_IF, format!("<{target_uri}> ([{}])", v.trim()));
+        }
+
         req = req.header(HEADER_DESTINATION, target_uri);
-        req = req.header(HEADER_OVERWRITE, "T");
 
         let req = req
             .extension(Operation::Copy)
@@ -429,6 +433,7 @@ impl WebdavCore {
         ctx: &OperationContext,
         from: &str,
         to: &str,
+        args: &OpRename,
     ) -> Result<Response<Buffer>> {
         // Check if source file exists.
         let _ = self.webdav_stat(ctx, from).await?;
@@ -448,7 +453,10 @@ impl WebdavCore {
         }
 
         req = req.header(HEADER_DESTINATION, target_uri);
-        req = req.header(HEADER_OVERWRITE, "T");
+        req = req.header(
+            HEADER_OVERWRITE,
+            if args.if_not_exists() { "F" } else { "T" },
+        );
 
         let req = req
             .extension(Operation::Rename)
@@ -1749,11 +1757,14 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::ConditionNotMatch);
     }
 
+    const TEST_URI: &str = "http://example.com/test";
+
     fn write_request(options: opendal_core::options::WriteOptions) -> http::Request<()> {
         let (args, _) = OpWrite::from_options(&opendal_core::Capability::default(), options)
             .expect("write options must lower");
         apply_etag_preconditions(
-            http::Request::put("http://example.com/test"),
+            http::Request::put(TEST_URI),
+            TEST_URI,
             args.if_not_exists(),
             args.if_match(),
             args.if_none_match(),
@@ -1762,88 +1773,46 @@ mod tests {
         .expect("request must build")
     }
 
-    fn delete_request(options: opendal_core::options::DeleteOptions) -> http::Request<()> {
-        let args = OpDelete::from_options(&opendal_core::Capability::default(), options)
-            .expect("delete options must lower");
-        apply_etag_preconditions(
-            http::Request::delete("http://example.com/test"),
-            false,
-            args.if_match(),
-            args.if_none_match(),
-        )
-        .body(())
-        .expect("request must build")
+    #[test]
+    fn test_write_preconditions_if_match_uses_tagged_if() {
+        // Strong and weak ETags both take the tagged `If` form: `If-Match` can
+        // never match a weak validator, and not every server enforces it.
+        for etag in ["\"strong\"", "W/\"weak\""] {
+            let req = write_request(opendal_core::options::WriteOptions {
+                if_match: Some(etag.to_string()),
+                ..Default::default()
+            });
+
+            assert!(req.headers().get(header::IF_MATCH).is_none());
+            assert_eq!(
+                req.headers().get(HEADER_IF).unwrap().to_str().unwrap(),
+                format!("<{TEST_URI}> ([{etag}])")
+            );
+        }
     }
 
     #[test]
-    fn test_write_preconditions_strong_etag_uses_if_match() {
-        let req = write_request(opendal_core::options::WriteOptions {
-            if_match: Some("\"strong\"".to_string()),
-            ..Default::default()
-        });
+    fn test_write_preconditions_if_none_match_uses_both_headers() {
+        // Servers disagree about which spelling they enforce, so send both.
+        for etag in ["\"strong\"", "W/\"weak\""] {
+            let req = write_request(opendal_core::options::WriteOptions {
+                if_none_match: Some(etag.to_string()),
+                ..Default::default()
+            });
 
-        assert_eq!(
-            req.headers()
-                .get(header::IF_MATCH)
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            "\"strong\""
-        );
-        assert!(req.headers().get(HEADER_IF).is_none());
-    }
-
-    #[test]
-    fn test_write_preconditions_weak_etag_uses_dav_if() {
-        let req = write_request(opendal_core::options::WriteOptions {
-            if_match: Some("W/\"weak\"".to_string()),
-            ..Default::default()
-        });
-
-        assert!(req.headers().get(header::IF_MATCH).is_none());
-        assert_eq!(
-            req.headers().get(HEADER_IF).unwrap().to_str().unwrap(),
-            "([W/\"weak\"])"
-        );
-    }
-
-    #[test]
-    fn test_write_preconditions_weak_if_none_match_uses_both() {
-        let req = write_request(opendal_core::options::WriteOptions {
-            if_none_match: Some("W/\"weak\"".to_string()),
-            ..Default::default()
-        });
-
-        assert_eq!(
-            req.headers()
-                .get(header::IF_NONE_MATCH)
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            "W/\"weak\""
-        );
-        assert_eq!(
-            req.headers().get(HEADER_IF).unwrap().to_str().unwrap(),
-            "(Not [W/\"weak\"])"
-        );
-    }
-
-    #[test]
-    fn test_write_preconditions_strong_if_none_match_has_no_dav_if() {
-        let req = write_request(opendal_core::options::WriteOptions {
-            if_none_match: Some("\"strong\"".to_string()),
-            ..Default::default()
-        });
-
-        assert_eq!(
-            req.headers()
-                .get(header::IF_NONE_MATCH)
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            "\"strong\""
-        );
-        assert!(req.headers().get(HEADER_IF).is_none());
+            assert_eq!(
+                req.headers()
+                    .get(header::IF_NONE_MATCH)
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                etag
+            );
+            assert_eq!(
+                req.headers().get(HEADER_IF).unwrap().to_str().unwrap(),
+                format!("<{TEST_URI}> (Not [{etag}])")
+            );
+        }
     }
 
     #[test]
@@ -1861,25 +1830,6 @@ mod tests {
                 .unwrap(),
             "*"
         );
-        assert!(req.headers().get(HEADER_IF).is_none());
-    }
-
-    #[test]
-    fn test_delete_preconditions_strong_etag_uses_if_match() {
-        let req = delete_request(opendal_core::options::DeleteOptions {
-            if_match: Some("\"strong\"".to_string()),
-            ..Default::default()
-        });
-
-        assert_eq!(
-            req.headers()
-                .get(header::IF_MATCH)
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            "\"strong\""
-        );
-        assert!(req.headers().get(header::IF_NONE_MATCH).is_none());
         assert!(req.headers().get(HEADER_IF).is_none());
     }
 }

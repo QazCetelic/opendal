@@ -227,8 +227,11 @@ impl Builder for WebdavBuilder {
                 delete_with_if_none_match: true,
 
                 copy: true,
+                copy_with_if_not_exists: true,
+                copy_with_if_match: true,
 
                 rename: true,
+                rename_with_if_not_exists: true,
 
                 list: true,
 
@@ -361,6 +364,7 @@ impl Service for WebdavBackend {
             let ctx = ctx.clone();
             let from = from.clone();
             let to = to.clone();
+            let args = args.clone();
 
             async move {
                 let source_size = match source_content_length_hint {
@@ -372,13 +376,21 @@ impl Service for WebdavBackend {
                         .content_length(),
                 };
 
-                let resp = core.webdav_copy(&ctx, &from, &to).await?;
+                let resp = core.webdav_copy(&ctx, &from, &to, &args).await?;
                 let status = resp.status();
 
                 match status {
                     StatusCode::CREATED | StatusCode::NO_CONTENT => {
                         Ok(MetadataBuilder::file(source_size).build())
                     }
+                    // A destination precondition cannot hold when nothing is
+                    // mapped there. Apache reports that as 412 and SabreDAV as
+                    // 404, so both surface it as `ConditionNotMatch`.
+                    StatusCode::NOT_FOUND if args.if_match().is_some() => Err(Error::new(
+                        ErrorKind::ConditionNotMatch,
+                        format!("copy from {from} to {to} failed: the destination does not exist"),
+                    )
+                    .with_operation(Operation::Copy)),
                     _ => Err(parse_error(
                         ErrorContext::new(ServiceOperation("Copy")),
                         resp,
@@ -393,9 +405,9 @@ impl Service for WebdavBackend {
         ctx: &OperationContext,
         from: &str,
         to: &str,
-        _args: OpRename,
+        args: OpRename,
     ) -> Result<RpRename> {
-        let resp = self.core.webdav_move(ctx, from, to).await?;
+        let resp = self.core.webdav_move(ctx, from, to, &args).await?;
 
         let status = resp.status();
         match status {

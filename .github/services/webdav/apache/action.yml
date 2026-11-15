@@ -27,13 +27,12 @@ runs:
       run: docker compose -f docker-compose-webdav-apache.yml up -d --wait
     # Overrides:
     # - mod_dav does not implement PROPPATCH, so user metadata is unsupported.
-    # - mod_dav returns weak ETags (`W/"..."`). `If-Match` requires the strong
-    #   comparison, so a conditional read can never match, and for DELETE the
-    #   untagged `If:` header is evaluated against the parent collection.
+    # - mod_dav returns a weak ETag while a file's mtime is in the current
+    #   second, and ignoring `If` on GET means `If-Match` is the only check.
     - name: Setup
       shell: bash
       run: |
         cat << EOF >> $GITHUB_ENV
         OPENDAL_WEBDAV_ENDPOINT=http://127.0.0.1:8080
-        OPENDAL_TEST_CAPABILITY_OVERRIDES=write_with_user_metadata=false,read_with_if_match=false,delete_with_if_match=false
+        OPENDAL_TEST_CAPABILITY_OVERRIDES=write_with_user_metadata=false,read_with_if_match=false
         EOF
